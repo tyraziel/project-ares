@@ -1,61 +1,70 @@
 #!/usr/bin/env python3
 """Analyze Claude Code conversation history to build a communication profile.
 
+Primary data source: ~/.claude/history.jsonl (user input history)
+Supplemental source: ~/.claude/projects/*/*.jsonl (for interrupt counts, where available)
+
 Usage:
-    # Analyze all projects
     python3 analyze_conversations.py --all
-
-    # Analyze specific project(s)
-    python3 analyze_conversations.py --project ~/.claude/projects/-home-user-myproject/
-
-    # Output to file (default: stdout)
-    python3 analyze_conversations.py --all -o profile.json
-
-    # Compare against a previous profile
+    python3 analyze_conversations.py --all --exclude company-simulator
+    python3 analyze_conversations.py --project awx-tui --project handbook
     python3 analyze_conversations.py --all --compare previous-profile.json -o profile.json
 """
 
 import argparse
 import json
-import os
 import re
+import string
 import sys
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
 
-def find_claude_dir():
-    """Find the ~/.claude directory."""
-    claude_dir = Path.home() / ".claude"
-    if not claude_dir.exists():
-        sys.exit("Error: ~/.claude directory not found. Is Claude Code installed?")
-    return claude_dir
+SYSTEM_PREFIXES = [
+    "<system-reminder>",
+    "<command-name>",
+    "<local-command",
+    "This session is being continued",
+    "Base directory for this skill:",
+]
+
+CLI_SLASH_COMMANDS = {
+    "/exit", "/resume", "/cost", "/compact", "/context", "/status",
+    "/model", "/rename", "/quit", "/info", "/usage", "/config",
+    "/plugin", "/permissions", "/plan", "/terminal-setup", "/help",
+    "/clear", "/doctor", "/fast", "/slow", "/review", "/init",
+    "/simplify", "/memory", "/mcp", "/login", "/logout", "/vim",
+}
+
+PASTE_MARKER_RE = re.compile(r"\[Pasted text #\d+ \+\d+ lines?\]")
+
+STOP_WORDS = {
+    "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had", "do", "does", "did", "will", "would", "shall",
+    "should", "can", "could", "may", "might", "must", "to", "of", "in",
+    "for", "on", "with", "at", "by", "from", "as", "into", "about",
+    "between", "through", "after", "before", "above", "below", "up",
+    "down", "out", "off", "over", "under", "again", "further", "then",
+    "once", "that", "this", "these", "those", "it", "its", "he", "she",
+    "they", "we", "you", "me", "him", "her", "us", "them", "my", "your",
+    "his", "our", "their", "what", "which", "who", "whom", "when",
+    "where", "why", "how", "all", "each", "every", "both", "few", "more",
+    "most", "other", "some", "such", "no", "not", "only", "same", "so",
+    "than", "too", "very", "just", "but", "and", "or", "if", "because",
+    "until", "while", "although", "though", "even", "also", "still",
+    "already", "yet", "here", "there", "now", "i", "am", "s", "t", "re",
+    "ve", "ll", "d", "m", "don", "doesn", "didn", "won", "wouldn",
+    "shouldn", "couldn", "isn", "aren", "wasn", "weren", "hasn", "haven",
+    "hadn",
+}
 
 
-def find_all_projects(claude_dir):
-    """Find all project directories under ~/.claude/projects/."""
-    projects_dir = claude_dir / "projects"
-    if not projects_dir.exists():
-        return []
-    return sorted([
-        p for p in projects_dir.iterdir()
-        if p.is_dir() and not p.name.startswith(".")
-    ])
-
-
-def find_conversation_files(project_dir):
-    """Find all JSONL conversation files in a project directory (excluding subagents)."""
-    return sorted([
-        f for f in project_dir.glob("*.jsonl")
-        if f.is_file()
-    ])
-
-
-def parse_messages(filepath):
-    """Parse a JSONL conversation file, yielding structured messages."""
+def load_history(history_path, project_filter=None, exclude_filters=None):
+    """Load and filter messages from history.jsonl."""
     messages = []
-    with open(filepath) as f:
+
+    with open(history_path) as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -65,174 +74,340 @@ def parse_messages(filepath):
             except json.JSONDecodeError:
                 continue
 
-            entry_type = entry.get("type", entry.get("role", ""))
-            if entry_type not in ("user", "assistant"):
+            display = entry.get("display", "")
+            project = entry.get("project", "")
+            ts_ms = entry.get("timestamp", 0)
+            session_id = entry.get("sessionId")
+
+            if not display or not display.strip():
                 continue
 
-            timestamp = entry.get("timestamp", "")
+            if project_filter:
+                if not any(pf in project for pf in project_filter):
+                    continue
+
+            if exclude_filters:
+                if any(ef in project for ef in exclude_filters):
+                    continue
+
+            if any(display.startswith(prefix) for prefix in SYSTEM_PREFIXES):
+                continue
+
+            if display.startswith("/") and not display.startswith("/home"):
+                first_token = display.split()[0].lower() if display.split() else ""
+                if first_token in CLI_SLASH_COMMANDS:
+                    continue
+
             ts_dt = None
-            if timestamp:
+            if ts_ms:
                 try:
-                    ts_dt = datetime.fromisoformat(timestamp)
-                except (ValueError, TypeError):
+                    ts_dt = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+                except (ValueError, OSError):
                     pass
 
-            message = entry.get("message", entry.get("content", {}))
-            if isinstance(message, str):
-                content = message
-            elif isinstance(message, dict):
-                content = message.get("content", "")
-            else:
-                content = ""
-
-            text_parts = []
-            raw_size = len(line.encode("utf-8"))
-
-            if isinstance(content, str):
-                if content.strip():
-                    text_parts.append(content.strip())
-            elif isinstance(content, list):
-                for item in content:
-                    if not isinstance(item, dict):
-                        continue
-                    if item.get("type") == "text":
-                        text = item.get("text", "").strip()
-                        if text:
-                            text_parts.append(text)
-
-            full_text = "\n\n".join(text_parts)
+            cleaned = PASTE_MARKER_RE.sub("", display).strip()
+            has_paste = bool(entry.get("pastedContents"))
 
             messages.append({
-                "role": entry_type,
-                "text": full_text,
-                "raw_size": raw_size,
+                "text": cleaned if cleaned else "",
+                "raw_display": display,
+                "length": len(cleaned) if cleaned else 0,
                 "timestamp": ts_dt,
+                "project": project,
+                "session_id": session_id,
+                "has_paste": has_paste,
             })
 
     return messages
 
 
-def is_system_content(text):
-    """Check if text is system-injected content rather than user-typed."""
-    indicators = [
-        "<system-reminder>", "<command-name>", "<local-command",
-        "## Chat History", "## Channel Membership", "## New Activity",
-        "You may also cross-post", "If you have something valuable",
-        "Do NOT prefix your response",
-    ]
-    return any(ind in text for ind in indicators)
+def extract_project_name(project_path):
+    """Extract a readable short name from a full project path."""
+    p = Path(project_path)
+    return p.name if p.name else str(p)
 
 
-def extract_user_text(text):
-    """Extract actual user-typed content, stripping system injections."""
-    if is_system_content(text):
-        # Try to extract just the user portion before system content
-        if "<system-reminder>" in text:
-            parts = text.split("<system-reminder>")
-            user_part = parts[0].strip()
-            if user_part:
-                return user_part
-        return ""
-    return text
+def detect_sessions(messages):
+    """Group messages into sessions using sessionId or time gaps."""
+    session_map = {}
+    session_counter = defaultdict(int)
 
+    by_project = defaultdict(list)
+    for i, msg in enumerate(messages):
+        by_project[msg["project"]].append((i, msg))
 
-def analyze_project(project_dir):
-    """Analyze all conversations in a project directory."""
-    project_name = project_dir.name
-    conv_files = find_conversation_files(project_dir)
+    for project, proj_msgs in by_project.items():
+        proj_msgs.sort(key=lambda x: x[1]["timestamp"] or datetime.min.replace(tzinfo=timezone.utc))
+        current_session = None
+        prev_ts = None
 
-    if not conv_files:
-        return None
+        for idx, msg in proj_msgs:
+            if msg["session_id"]:
+                current_session = msg["session_id"]
+            else:
+                gap = float("inf")
+                if prev_ts and msg["timestamp"]:
+                    gap = (msg["timestamp"] - prev_ts).total_seconds()
+                if gap > 1800 or current_session is None:
+                    short = extract_project_name(project)
+                    session_counter[short] += 1
+                    current_session = f"inferred-{short}-{session_counter[short]}"
 
-    all_user_messages = []
-    all_assistant_messages = []
-    session_count = len(conv_files)
-    total_raw_user = 0
-    total_raw_assistant = 0
-    timestamps = []
+            session_map[idx] = current_session
+            if msg["timestamp"]:
+                prev_ts = msg["timestamp"]
 
-    for conv_file in conv_files:
-        messages = parse_messages(conv_file)
-        for msg in messages:
-            if msg["role"] in ("user", "human"):
-                total_raw_user += msg["raw_size"]
-                user_text = extract_user_text(msg["text"])
-                if user_text and len(user_text) < 5000:
-                    all_user_messages.append({
-                        "text": user_text,
-                        "length": len(user_text),
-                        "timestamp": msg["timestamp"],
-                    })
-                    if msg["timestamp"]:
-                        timestamps.append(msg["timestamp"])
-            elif msg["role"] == "assistant":
-                total_raw_assistant += msg["raw_size"]
-                if msg["text"]:
-                    all_assistant_messages.append({
-                        "text": msg["text"],
-                        "length": len(msg["text"]),
-                    })
-
-    if not all_user_messages:
-        return None
+    unique_sessions = set(session_map.values())
+    sessions_per_project = defaultdict(set)
+    for idx, sid in session_map.items():
+        sessions_per_project[messages[idx]["project"]].add(sid)
 
     return {
-        "project_name": project_name,
-        "session_count": session_count,
-        "user_message_count": len(all_user_messages),
-        "assistant_message_count": len(all_assistant_messages),
-        "total_raw_user_bytes": total_raw_user,
-        "total_raw_assistant_bytes": total_raw_assistant,
-        "user_messages": all_user_messages,
-        "timestamps": timestamps,
+        "total_sessions": len(unique_sessions),
+        "sessions_per_project": {k: len(v) for k, v in sessions_per_project.items()},
+        "session_map": session_map,
+        "session_first_indices": _find_session_firsts(session_map),
+    }
+
+
+def _find_session_firsts(session_map):
+    """Find the first message index for each session."""
+    firsts = {}
+    for idx, sid in sorted(session_map.items()):
+        if sid not in firsts:
+            firsts[sid] = idx
+    return set(firsts.values())
+
+
+def count_interrupts_from_project_jsonl():
+    """Count [Request interrupted by user] from project JSONL files (supplemental)."""
+    projects_dir = Path.home() / ".claude" / "projects"
+    if not projects_dir.exists():
+        return 0, {}
+
+    total = 0
+    per_project = Counter()
+
+    for project_dir in projects_dir.iterdir():
+        if not project_dir.is_dir() or project_dir.name.startswith("."):
+            continue
+        for jsonl_file in project_dir.glob("*.jsonl"):
+            try:
+                with open(jsonl_file) as f:
+                    for line in f:
+                        if "Request interrupted" in line:
+                            try:
+                                entry = json.loads(line)
+                                etype = entry.get("type", entry.get("role", ""))
+                                if etype == "user":
+                                    content = ""
+                                    msg = entry.get("message", entry.get("content", ""))
+                                    if isinstance(msg, str):
+                                        content = msg
+                                    elif isinstance(msg, dict):
+                                        content = str(msg.get("content", ""))
+                                    if "[Request interrupted" in content:
+                                        total += 1
+                                        per_project[project_dir.name] += 1
+                            except json.JSONDecodeError:
+                                continue
+            except (PermissionError, OSError):
+                continue
+
+    return total, dict(per_project)
+
+
+def tokenize(text):
+    """Tokenize text into lowercase words, stripping punctuation."""
+    text = text.lower()
+    text = re.sub(r"https?://\S+", "", text)
+    text = re.sub(r"/[\w/.-]+", "", text)
+    words = text.split()
+    result = []
+    for w in words:
+        w = w.strip(string.punctuation + "\u2018\u2019\u201c\u201d")
+        if w and len(w) > 1 and not w.isdigit():
+            result.append(w)
+    return result
+
+
+def discover_phrases(messages):
+    """Discover frequent words and phrases from message text."""
+    word_counter = Counter()
+    bigram_counter = Counter()
+    trigram_counter = Counter()
+    ending_counter = Counter()
+    opening_word_counter = Counter()
+    opening_bigram_counter = Counter()
+    opening_trigram_counter = Counter()
+
+    for msg in messages:
+        if not msg["text"] or msg["has_paste"] and not msg["text"].strip():
+            continue
+
+        words = tokenize(msg["text"])
+        if not words:
+            continue
+
+        for w in words:
+            if w not in STOP_WORDS:
+                word_counter[w] += 1
+
+        for i in range(len(words) - 1):
+            bg = f"{words[i]} {words[i+1]}"
+            if not (words[i] in STOP_WORDS and words[i+1] in STOP_WORDS):
+                bigram_counter[bg] += 1
+
+        for i in range(len(words) - 2):
+            tg = f"{words[i]} {words[i+1]} {words[i+2]}"
+            if not all(w in STOP_WORDS for w in [words[i], words[i+1], words[i+2]]):
+                trigram_counter[tg] += 1
+
+        last_word = msg["text"].rstrip().split()[-1].lower() if msg["text"].strip() else None
+        if last_word:
+            ending_counter[last_word] += 1
+
+        raw_words = msg["text"].lower().split()
+        if raw_words:
+            opening_word_counter[raw_words[0]] += 1
+        if len(raw_words) >= 2:
+            opening_bigram_counter[f"{raw_words[0]} {raw_words[1]}"] += 1
+        if len(raw_words) >= 3:
+            opening_trigram_counter[f"{raw_words[0]} {raw_words[1]} {raw_words[2]}"] += 1
+
+    return {
+        "top_words": [[w, c] for w, c in word_counter.most_common(30)],
+        "top_bigrams": [[p, c] for p, c in bigram_counter.most_common(30) if c >= 3],
+        "top_trigrams": [[p, c] for p, c in trigram_counter.most_common(20) if c >= 3],
+        "ending_patterns": [[w, c] for w, c in ending_counter.most_common(20)],
+        "opening_words": [[w, c] for w, c in opening_word_counter.most_common(15)],
+        "opening_bigrams": [[p, c] for p, c in opening_bigram_counter.most_common(15)],
+        "opening_trigrams": [[p, c] for p, c in opening_trigram_counter.most_common(15)],
     }
 
 
 def analyze_verbal_patterns(messages):
-    """Analyze verbal tics, catchphrases, and language patterns."""
-    texts = [m["text"].lower() for m in messages]
-    all_text = " ".join(texts)
+    """Analyze verbal patterns — general detectors + dynamic phrase discovery."""
+    texts = [m["text"].lower() for m in messages if m["text"]]
+    raw_texts = [m["text"] for m in messages if m["text"]]
 
-    patterns = {
-        "ellipsis_usage": sum(1 for t in texts if "..." in t),
+    # --- Opener patterns ---
+    openers = {
+        "starts_with_hey": sum(1 for t in texts if t.startswith("hey")),
         "starts_with_ok": sum(1 for t in texts if t.startswith("ok ")),
         "starts_with_yes": sum(1 for t in texts if t.startswith("yes")),
-        "starts_with_hey": sum(1 for t in texts if t.startswith("hey")),
-        "starts_lowercase": sum(1 for m in messages if m["text"] and m["text"][0].islower()),
-        "contains_lol": sum(1 for t in texts if "lol" in t),
-        "contains_bruh": sum(1 for t in texts if "bruh" in t),
-        "contains_right_question": sum(1 for t in texts if t.rstrip().endswith("right?")),
-        "contains_make_it_so": sum(1 for t in texts if "make it so" in t),
-        "contains_mood_misalign": sum(1 for t in texts if "mood" in t and ("misalign" in t or "aligned" in t)),
-        "contains_sad_womps": sum(1 for t in texts if "sad womp" in t),
-        "contains_whatevs": sum(1 for t in texts if "whatevs" in t),
-        "contains_obvs": sum(1 for t in texts if "obvs" in t),
-        "contains_carry_on": sum(1 for t in texts if "carry on" in t),
-        "contains_thoughts": sum(1 for t in texts if t.rstrip().endswith("thoughts?")),
-        "contains_emoji_shortcode": sum(1 for t in texts if re.search(r":[a-z_-]+:", t)),
-        "contains_emoticon": sum(1 for t in texts if re.search(r"[:;][PpDd/\\)(]", t)),
-        "uses_we": sum(1 for t in texts if re.search(r"\bwe\b", t)),
-        "uses_interrupts": sum(1 for t in texts if "request interrupted" in t.lower()),
+        "starts_with_no": sum(1 for t in texts if re.match(r"^no[\s,.]", t) or t == "no"),
+        "starts_with_so": sum(1 for t in texts if t.startswith("so ")),
+        "starts_with_well": sum(1 for t in texts if t.startswith("well")),
+        "starts_with_lets": sum(1 for t in texts if t.startswith("let's") or t.startswith("lets")),
+        "starts_with_can_you": sum(1 for t in texts if t.startswith("can you")),
+        "starts_with_i_think": sum(1 for t in texts if t.startswith("i think")),
     }
 
-    # Find potential catchphrases (2-4 word phrases that appear 3+ times)
-    word_pairs = Counter()
+    # --- Punctuation intensity ---
+    punctuation = {
+        "ends_with_question": sum(1 for t in texts if t.rstrip().endswith("?")),
+        "contains_exclamation": sum(1 for t in texts if "!" in t),
+        "multi_exclamation": sum(1 for t in texts if "!!" in t),
+        "multi_question": sum(1 for t in texts if "??" in t),
+        "all_caps_words": sum(
+            len(re.findall(r"\b[A-Z]{2,}\b", rt))
+            for rt in raw_texts
+            if re.search(r"\b[A-Z]{2,}\b", rt)
+        ),
+        "msgs_with_all_caps": sum(
+            1 for rt in raw_texts
+            if re.search(r"\b[A-Z]{3,}\b", rt)
+            and not re.match(r"^[A-Z\s\-]+$", rt.strip())
+        ),
+    }
+
+    # --- Pronoun / collaboration ---
+    pronouns = {
+        "uses_we": sum(1 for t in texts if re.search(r"\bwe\b", t)),
+        "uses_I": sum(1 for rt in raw_texts if re.search(r"\bI\b", rt)),
+    }
+    we_count = pronouns["uses_we"]
+    i_count = pronouns["uses_I"]
+    pronouns["we_vs_I_ratio"] = round(we_count / i_count, 2) if i_count > 0 else None
+
+    # --- Typing style fingerprints ---
+    style = {
+        "ellipsis_usage": sum(1 for t in texts if "..." in t),
+        "starts_lowercase": sum(1 for rt in raw_texts if rt[0].islower()),
+        "emoticon_usage": sum(1 for t in texts if re.search(r"[:;][PpDd/\\)(]", t)),
+        "emoji_shortcode_usage": sum(1 for t in texts if re.search(r":[a-z_]+:", t)),
+        "dash_connectors": sum(1 for rt in raw_texts if " -- " in rt or " - " in rt),
+        "parenthetical_asides": sum(1 for rt in raw_texts if re.search(r"\([^)]{3,}\)", rt)),
+    }
+
+    # --- Humor / affect ---
+    affect = {
+        "contains_lol": sum(1 for t in texts if re.search(r"\blol\b", t)),
+        "contains_haha": sum(1 for t in texts if re.search(r"\bhaha", t)),
+    }
+
+    # --- Confidence / hedging ---
+    hedging = {
+        "hedging_language": sum(
+            1 for t in texts
+            if re.search(r"\b(maybe|probably|i guess|idk|not sure|i suppose|might be)\b", t)
+        ),
+        "assertive_language": sum(
+            1 for t in texts
+            if re.search(r"\b(definitely|absolutely|obviously|clearly|exactly|certainly)\b", t)
+        ),
+    }
+    hedge_count = hedging["hedging_language"]
+    assert_count = hedging["assertive_language"]
+    hedging["hedge_vs_assert_ratio"] = round(hedge_count / assert_count, 2) if assert_count > 0 else None
+
+    # --- Self-correction ---
+    self_correction = {
+        "self_correction": sum(
+            1 for t in texts
+            if re.search(r"\b(actually|wait|scratch that|never mind|nevermind|well actually|nah)\b", t)
+        ),
+    }
+
+    # --- Message complexity ---
+    sentence_counts = []
     for t in texts:
-        words = t.split()
-        for i in range(len(words) - 1):
-            pair = f"{words[i]} {words[i+1]}"
-            if len(pair) > 5:
-                word_pairs[pair] += 1
+        sents = len(re.findall(r"[.!?]+", t)) or 1
+        sentence_counts.append(sents)
+    complexity = {
+        "avg_sentences_per_message": round(sum(sentence_counts) / len(sentence_counts), 1) if sentence_counts else 0,
+    }
 
-    patterns["common_phrases"] = {k: v for k, v in word_pairs.most_common(30) if v >= 3}
-    patterns["total_messages"] = len(messages)
+    # --- Totals ---
+    totals = {
+        "total_messages": len(messages),
+        "non_empty_messages": len(texts),
+    }
 
-    return patterns
+    general = {
+        **openers,
+        **punctuation,
+        **pronouns,
+        **style,
+        **affect,
+        **hedging,
+        **self_correction,
+        **complexity,
+        **totals,
+    }
+
+    phrases = discover_phrases(messages)
+
+    return {
+        "general": general,
+        **phrases,
+    }
 
 
 def analyze_message_lengths(messages):
     """Analyze message length distribution."""
-    lengths = [m["length"] for m in messages]
+    lengths = [m["length"] for m in messages if m["length"] > 0]
     if not lengths:
         return {}
 
@@ -252,39 +427,49 @@ def analyze_message_lengths(messages):
     }
 
 
-def analyze_time_patterns(timestamps):
+def analyze_time_patterns(messages):
     """Analyze time-of-day and day-of-week patterns."""
+    timestamps = [m["timestamp"] for m in messages if m["timestamp"]]
     if not timestamps:
         return {}
 
     hours = Counter()
     days = Counter()
+    months = Counter()
     day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
     for ts in timestamps:
-        if ts:
-            hours[ts.hour] += 1
-            days[day_names[ts.weekday()]] += 1
-
-    # Find peak hours (top 5)
-    peak_hours = hours.most_common(5)
+        hours[ts.hour] += 1
+        days[day_names[ts.weekday()]] += 1
+        months[ts.strftime("%Y-%m")] += 1
 
     return {
         "hour_distribution": dict(sorted(hours.items())),
         "day_distribution": dict(days),
-        "peak_hours_utc": peak_hours,
+        "month_distribution": dict(sorted(months.items())),
+        "peak_hours_utc": hours.most_common(5),
         "total_timestamps": len(timestamps),
     }
 
 
-def analyze_greeting_patterns(messages):
+def analyze_greeting_patterns(messages, session_first_indices=None):
     """Analyze how the user opens conversations."""
     greetings = []
-    for m in messages:
-        text = m["text"].strip().lower()
-        if any(text.startswith(g) for g in ["hey ", "hi ", "hello ", "sup", "howdy"]):
-            greetings.append(m["text"][:200])
-    return greetings[:20]
+    session_openers = []
+
+    for i, m in enumerate(messages):
+        text = m["text"].strip()
+        lower = text.lower()
+        if any(lower.startswith(g) for g in ["hey ", "hi ", "hello ", "sup", "howdy", "yo "]):
+            greetings.append(text[:200])
+
+        if session_first_indices and i in session_first_indices:
+            session_openers.append(text[:200])
+
+    return {
+        "greeting_messages": greetings[:30],
+        "session_openers": session_openers[:30],
+    }
 
 
 def analyze_approval_disapproval(messages):
@@ -292,32 +477,38 @@ def analyze_approval_disapproval(messages):
     approval_patterns = [
         "perfect", "brilliant", "nice", "well done", "make it so",
         "yes", "yeah", "go for it", "looks good", "i like",
-        "nailed it", "exactly", "that's great",
+        "nailed it", "exactly", "that's great", "love it",
+        "awesome", "good call", "that works",
     ]
     disapproval_patterns = [
         "still isn't", "still doesn't", "still not", "still nothing",
         "doesn't work", "isn't working", "not working",
         "don't like", "shouldn't", "why would", "why are you",
-        "bruh", "ugh", "no ", "nope",
+        "bruh", "ugh", "no ", "nope", "wrong", "that's not",
     ]
 
     approvals = []
     disapprovals = []
 
     for m in messages:
-        text = m["text"].lower().strip()
+        text = m["text"]
+        if not text:
+            continue
+        lower = text.lower().strip()
+        if len(text) > 300:
+            continue
         for pat in approval_patterns:
-            if pat in text and len(m["text"]) < 300:
-                approvals.append(m["text"][:200])
+            if pat in lower:
+                approvals.append(text[:200])
                 break
         for pat in disapproval_patterns:
-            if pat in text and len(m["text"]) < 300:
-                disapprovals.append(m["text"][:200])
+            if pat in lower:
+                disapprovals.append(text[:200])
                 break
 
     return {
-        "approvals": approvals[:15],
-        "disapprovals": disapprovals[:15],
+        "approvals": approvals[:20],
+        "disapprovals": disapprovals[:20],
     }
 
 
@@ -329,133 +520,132 @@ def analyze_instruction_style(messages):
 
     for m in messages:
         text = m["text"].strip()
+        if not text or len(text) > 500:
+            continue
         lower = text.lower()
 
-        if len(text) > 500:
-            continue
-
-        # Questions that are really instructions
-        if re.search(r"(shouldn't we|why can't we|what if we|what about|can we|should we)", lower):
+        if re.search(r"(shouldn't we|why can't we|what if we|what about|can we|should we|how about)", lower):
             questions_as_instructions.append(text[:200])
-        # Thinking out loud (ellipsis-heavy)
         elif text.count("...") >= 2 or text.count("....") >= 1:
             thinking_out_loud.append(text[:200])
-        # Short direct commands
         elif len(text) < 80 and not text.endswith("?"):
             direct_commands.append(text[:200])
 
     return {
-        "questions_as_instructions": questions_as_instructions[:10],
-        "direct_commands": direct_commands[:15],
-        "thinking_out_loud": thinking_out_loud[:10],
+        "questions_as_instructions": questions_as_instructions[:15],
+        "direct_commands": direct_commands[:20],
+        "thinking_out_loud": thinking_out_loud[:15],
     }
 
 
-def build_profile(project_analyses):
-    """Build a complete profile from all project analyses."""
-    all_user_messages = []
-    all_timestamps = []
+def build_profile(messages, session_info, include_interrupts=True):
+    """Build a complete profile from the message list."""
+    by_project = defaultdict(list)
+    for msg in messages:
+        by_project[msg["project"]].append(msg)
+
     project_summaries = []
-
-    for analysis in project_analyses:
-        if not analysis:
-            continue
-        all_user_messages.extend(analysis["user_messages"])
-        all_timestamps.extend(analysis["timestamps"])
-
-        short_name = analysis["project_name"]
-        # Strip common prefix
-        for prefix in ["-home-", "apotozni-sbx-"]:
-            idx = short_name.find(prefix)
-            if idx >= 0:
-                short_name = short_name[idx + len(prefix):]
-
+    for project_path, proj_msgs in by_project.items():
+        timestamps = [m["timestamp"] for m in proj_msgs if m["timestamp"]]
         project_summaries.append({
-            "name": short_name,
-            "sessions": analysis["session_count"],
-            "user_messages": analysis["user_message_count"],
-            "assistant_messages": analysis["assistant_message_count"],
-            "raw_user_bytes": analysis["total_raw_user_bytes"],
-            "raw_assistant_bytes": analysis["total_raw_assistant_bytes"],
+            "name": extract_project_name(project_path),
+            "full_path": project_path,
+            "user_messages": len(proj_msgs),
+            "sessions": session_info["sessions_per_project"].get(project_path, 0),
+            "date_range": {
+                "first": min(timestamps).isoformat() if timestamps else None,
+                "last": max(timestamps).isoformat() if timestamps else None,
+            },
         })
 
-    profile = {
-        "generated_at": datetime.now().isoformat(),
-        "total_projects": len(project_summaries),
-        "total_user_messages": len(all_user_messages),
-        "total_timestamps": len(all_timestamps),
-        "projects": sorted(project_summaries, key=lambda x: x["user_messages"], reverse=True),
-        "verbal_patterns": analyze_verbal_patterns(all_user_messages),
-        "message_lengths": analyze_message_lengths(all_user_messages),
-        "time_patterns": analyze_time_patterns(all_timestamps),
-        "greeting_patterns": analyze_greeting_patterns(all_user_messages),
-        "approval_disapproval": analyze_approval_disapproval(all_user_messages),
-        "instruction_style": analyze_instruction_style(all_user_messages),
-        "sample_messages": {
-            "shortest": sorted(all_user_messages, key=lambda x: x["length"])[:10],
-            "longest": sorted(all_user_messages, key=lambda x: x["length"], reverse=True)[:10],
-        },
+    project_summaries.sort(key=lambda x: x["user_messages"], reverse=True)
+
+    all_timestamps = [m["timestamp"] for m in messages if m["timestamp"]]
+    date_range = {
+        "first": min(all_timestamps).isoformat() if all_timestamps else None,
+        "last": max(all_timestamps).isoformat() if all_timestamps else None,
     }
 
-    # Clean timestamps from sample messages (not JSON serializable)
-    for category in ["shortest", "longest"]:
-        for msg in profile["sample_messages"][category]:
-            if msg.get("timestamp"):
-                msg["timestamp"] = msg["timestamp"].isoformat()
-            else:
-                msg["timestamp"] = None
+    profile = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "data_source": "~/.claude/history.jsonl",
+        "date_range": date_range,
+        "total_projects": len(project_summaries),
+        "total_sessions": session_info["total_sessions"],
+        "total_user_messages": len(messages),
+        "projects": project_summaries,
+        "verbal_patterns": analyze_verbal_patterns(messages),
+        "message_lengths": analyze_message_lengths(messages),
+        "time_patterns": analyze_time_patterns(messages),
+        "greeting_patterns": analyze_greeting_patterns(
+            messages,
+            session_first_indices=session_info.get("session_first_indices"),
+        ),
+        "approval_disapproval": analyze_approval_disapproval(messages),
+        "instruction_style": analyze_instruction_style(messages),
+        "sample_messages": _build_sample_messages(messages),
+    }
 
-    # Clean timestamps from greeting patterns and other places
-    for msg in all_user_messages:
-        if isinstance(msg.get("timestamp"), datetime):
-            msg["timestamp"] = msg["timestamp"].isoformat()
-
-    # Clean time_patterns timestamps
-    for ts_list_key in ["timestamps"]:
-        if ts_list_key in profile:
-            profile[ts_list_key] = [
-                t.isoformat() if isinstance(t, datetime) else t
-                for t in profile[ts_list_key]
-            ]
-
-    # Remove raw message list from output (too large)
-    del profile["total_timestamps"]
-    if "timestamps" in profile:
-        del profile["timestamps"]
+    if include_interrupts:
+        interrupt_total, interrupt_per_project = count_interrupts_from_project_jsonl()
+        profile["interrupts"] = {
+            "total": interrupt_total,
+            "per_project": interrupt_per_project,
+            "note": "Counted from project JSONL files (recent data only, not full history)",
+        }
 
     return profile
 
 
+def _build_sample_messages(messages):
+    """Build sample message lists for the profile."""
+    non_empty = [m for m in messages if m["length"] > 0]
+    shortest = sorted(non_empty, key=lambda x: x["length"])[:10]
+    longest = sorted(non_empty, key=lambda x: x["length"], reverse=True)[:10]
+
+    def serialize(msg):
+        return {
+            "text": msg["text"][:500],
+            "length": msg["length"],
+            "timestamp": msg["timestamp"].isoformat() if msg["timestamp"] else None,
+            "project": extract_project_name(msg["project"]),
+        }
+
+    return {
+        "shortest": [serialize(m) for m in shortest],
+        "longest": [serialize(m) for m in longest],
+    }
+
+
 def compare_profiles(current, previous):
-    """Compare current profile against a previous one and return differences."""
+    """Compare current profile against a previous one."""
     diffs = {}
 
-    # Message count changes
     prev_total = previous.get("total_user_messages", 0)
     curr_total = current.get("total_user_messages", 0)
     diffs["message_count_change"] = curr_total - prev_total
 
-    # Project changes
     prev_projects = {p["name"] for p in previous.get("projects", [])}
     curr_projects = {p["name"] for p in current.get("projects", [])}
-    diffs["new_projects"] = list(curr_projects - prev_projects)
-    diffs["removed_projects"] = list(prev_projects - curr_projects)
+    diffs["new_projects"] = sorted(curr_projects - prev_projects)
+    diffs["removed_projects"] = sorted(prev_projects - curr_projects)
 
-    # Verbal pattern changes
-    prev_verbal = previous.get("verbal_patterns", {})
-    curr_verbal = current.get("verbal_patterns", {})
+    prev_verbal = previous.get("verbal_patterns", {}).get("general", previous.get("verbal_patterns", {}))
+    curr_verbal = current.get("verbal_patterns", {}).get("general", {})
     verbal_changes = {}
     for key in set(list(prev_verbal.keys()) + list(curr_verbal.keys())):
-        if key in ("common_phrases", "total_messages"):
+        if key in ("total_messages", "non_empty_messages", "we_vs_I_ratio"):
             continue
         prev_val = prev_verbal.get(key, 0)
         curr_val = curr_verbal.get(key, 0)
+        if not isinstance(prev_val, (int, float)) or not isinstance(curr_val, (int, float)):
+            continue
         if prev_val != curr_val:
             prev_total_msgs = prev_verbal.get("total_messages", 1)
             curr_total_msgs = curr_verbal.get("total_messages", 1)
             prev_pct = (prev_val / prev_total_msgs * 100) if prev_total_msgs else 0
             curr_pct = (curr_val / curr_total_msgs * 100) if curr_total_msgs else 0
-            if abs(curr_pct - prev_pct) > 1:  # Only report >1% changes
+            if abs(curr_pct - prev_pct) > 1:
                 verbal_changes[key] = {
                     "previous": f"{prev_val} ({prev_pct:.1f}%)",
                     "current": f"{curr_val} ({curr_pct:.1f}%)",
@@ -463,7 +653,11 @@ def compare_profiles(current, previous):
                 }
     diffs["verbal_pattern_changes"] = verbal_changes
 
-    # Message length changes
+    prev_phrases = {p[0] for p in previous.get("verbal_patterns", {}).get("top_bigrams", [])}
+    curr_phrases = {p[0] for p in current.get("verbal_patterns", {}).get("top_bigrams", [])}
+    diffs["new_phrases"] = sorted(curr_phrases - prev_phrases)
+    diffs["dropped_phrases"] = sorted(prev_phrases - curr_phrases)
+
     prev_lengths = previous.get("message_lengths", {})
     curr_lengths = current.get("message_lengths", {})
     if prev_lengths and curr_lengths:
@@ -472,7 +666,6 @@ def compare_profiles(current, previous):
             "median": {"previous": prev_lengths.get("median"), "current": curr_lengths.get("median")},
         }
 
-    # Time pattern changes
     prev_time = previous.get("time_patterns", {})
     curr_time = current.get("time_patterns", {})
     if prev_time and curr_time:
@@ -481,6 +674,11 @@ def compare_profiles(current, previous):
             "current_peak_hours": curr_time.get("peak_hours_utc"),
         }
 
+    diffs["date_range"] = {
+        "previous": previous.get("date_range"),
+        "current": current.get("date_range"),
+    }
+
     return diffs
 
 
@@ -488,57 +686,47 @@ def main():
     parser = argparse.ArgumentParser(
         description="Analyze Claude Code conversation history to build a communication profile"
     )
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument(
-        "--all",
-        action="store_true",
-        help="Analyze all projects in ~/.claude/projects/",
-    )
-    group.add_argument(
-        "--project",
-        action="append",
-        help="Specific project directory to analyze (can be repeated)",
+    scope = parser.add_mutually_exclusive_group(required=True)
+    scope.add_argument("--all", action="store_true", help="Analyze all projects")
+    scope.add_argument(
+        "--project", action="append",
+        help="Filter to projects matching this substring (can be repeated)",
     )
     parser.add_argument(
-        "-o", "--output",
-        help="Output file path for the profile JSON. Defaults to stdout.",
+        "--exclude", action="append",
+        help="Exclude projects matching this substring (can be repeated)",
     )
-    parser.add_argument(
-        "--compare",
-        help="Path to a previous profile JSON to compare against.",
-    )
+    parser.add_argument("-o", "--output", help="Output file path (default: stdout)")
+    parser.add_argument("--compare", help="Path to a previous profile JSON to compare against")
+
     args = parser.parse_args()
 
-    claude_dir = find_claude_dir()
+    history_path = Path.home() / ".claude" / "history.jsonl"
+    if not history_path.exists():
+        sys.exit("Error: ~/.claude/history.jsonl not found. Is Claude Code installed?")
 
-    # Determine which projects to analyze
-    if args.all:
-        project_dirs = find_all_projects(claude_dir)
-    else:
-        project_dirs = [Path(p) for p in args.project]
+    project_filter = args.project if not args.all else None
+    exclude_filters = args.exclude
 
-    if not project_dirs:
-        sys.exit("Error: No projects found to analyze.")
+    print(f"Loading history from {history_path}...", file=sys.stderr)
+    messages = load_history(history_path, project_filter, exclude_filters)
 
-    print(f"Analyzing {len(project_dirs)} project(s)...", file=sys.stderr)
+    if not messages:
+        sys.exit("Error: No messages found matching the given filters.")
 
-    # Analyze each project
-    analyses = []
-    for project_dir in project_dirs:
-        print(f"  {project_dir.name}...", file=sys.stderr)
-        analysis = analyze_project(project_dir)
-        if analysis:
-            analyses.append(analysis)
+    projects_found = len(set(m["project"] for m in messages))
+    print(f"Found {len(messages)} messages across {projects_found} project(s).", file=sys.stderr)
 
-    if not analyses:
-        sys.exit("Error: No conversation data found in any project.")
+    if exclude_filters:
+        print(f"Excluding: {', '.join(exclude_filters)}", file=sys.stderr)
 
-    print(f"Found data in {len(analyses)} project(s).", file=sys.stderr)
+    print("Detecting sessions...", file=sys.stderr)
+    session_info = detect_sessions(messages)
+    print(f"Found {session_info['total_sessions']} session(s).", file=sys.stderr)
 
-    # Build profile
-    profile = build_profile(analyses)
+    print("Building profile...", file=sys.stderr)
+    profile = build_profile(messages, session_info)
 
-    # Compare if requested
     if args.compare:
         compare_path = Path(args.compare)
         if not compare_path.exists():
@@ -549,7 +737,6 @@ def main():
             profile["comparison"] = compare_profiles(profile, previous)
             print("Comparison with previous profile included.", file=sys.stderr)
 
-    # Output
     output_json = json.dumps(profile, indent=2, default=str)
 
     if args.output:
