@@ -35,6 +35,9 @@ Full conversation files (both user and assistant messages, tool calls, etc.) but
 - Interrupt counts (`[Request interrupted by user]` markers)
 - Not used for primary analysis since coverage is incomplete
 
+### Note on multi-agent projects (e.g., company-simulator)
+Projects that use the Claude Agent SDK to run multiple agent sessions inject simulated agent messages into the **project JSONL files** as "user" messages — this pollutes those files with orchestrator/bot traffic. However, `history.jsonl` only records what the **actual user typed**, so it is safe to include these projects without `--exclude`. The `--exclude` flag is still available if needed for other reasons.
+
 ### Diagnostic: `scripts/inspect_data_sources.py`
 A utility script that reports on available data, date ranges, and compares history.jsonl coverage against project JSONL files. Run this to diagnose gaps or validate data availability:
 ```bash
@@ -59,14 +62,14 @@ Check if the user provided arguments: $ARGUMENTS
 The script is located at `scripts/analyze_conversations.py` relative to this skill's directory.
 
 ```bash
-# Analyze all projects
+# Analyze all projects (safe for multi-agent projects — history.jsonl only has real user input)
 python3 <skill-dir>/scripts/analyze_conversations.py --all -o <output-path>.json
-
-# Exclude noisy projects (e.g., multi-agent simulators with bot logs)
-python3 <skill-dir>/scripts/analyze_conversations.py --all --exclude company-simulator -o <output-path>.json
 
 # Analyze specific project(s) by substring match
 python3 <skill-dir>/scripts/analyze_conversations.py --project awx-tui --project handbook -o <output-path>.json
+
+# Exclude specific projects if needed
+python3 <skill-dir>/scripts/analyze_conversations.py --all --exclude some-project -o <output-path>.json
 
 # Compare against a previous profile
 python3 <skill-dir>/scripts/analyze_conversations.py --all --compare <previous-profile.json> -o <output-path>.json
